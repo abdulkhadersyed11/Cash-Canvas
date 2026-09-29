@@ -819,3 +819,67 @@ def create_forecast_budget_chart(current_spend: float, forecast_spend: float, bu
 
     chart = alt.layer(bars, labels).properties(title="Forecast vs Budget", width=720, height=260)
     return _apply_dark_theme(chart)
+
+def build_velocity_radar_chart(forecast_df: pd.DataFrame, monthly_budget: float = 0.0) -> alt.Chart:
+    """Builds the multi-line EWMA Velocity Radar chart comparing actuals, projections, and budget pace."""
+    if forecast_df is None or forecast_df.empty:
+        empty_df = pd.DataFrame({"day": [1], "spend": [0]})
+        return alt.Chart(empty_df).mark_line().encode(x="day:Q", y="spend:Q")
+
+    chart_data = forecast_df.copy()
+
+    # 1. Ideal linear pace line
+    ideal_line = alt.Chart(chart_data).mark_line(
+        strokeDash=[4, 4],
+        color="#7F8C8D",
+        size=1.5
+    ).encode(
+        x=alt.X("day:Q", title="Day of Month", axis=alt.Axis(tickMinStep=1)),
+        y=alt.Y("ideal_pace:Q", title="Cumulative Expenditure (₹)"),
+        tooltip=[alt.Tooltip("day:Q", title="Day"), alt.Tooltip("ideal_pace:Q", title="Ideal Target (₹)", format=",.2f")]
+    )
+
+    # 2. Actual spending solid line + points
+    actual_data = chart_data.dropna(subset=["actual_spend"])
+    actual_line = alt.Chart(actual_data).mark_line(
+        color="#2ECC71",
+        size=3
+    ).encode(
+        x=alt.X("day:Q"),
+        y=alt.Y("actual_spend:Q"),
+        tooltip=[alt.Tooltip("day:Q", title="Day"), alt.Tooltip("actual_spend:Q", title="Actual Spent (₹)", format=",.2f")]
+    )
+    actual_points = alt.Chart(actual_data).mark_circle(
+        color="#2ECC71",
+        size=40
+    ).encode(
+        x="day:Q",
+        y="actual_spend:Q"
+    )
+
+    # 3. EWMA projected trajectory (dashed)
+    proj_data = chart_data[chart_data["actual_spend"].isna() | (chart_data["day"] == actual_data["day"].max() if not actual_data.empty else False)]
+    proj_line = alt.Chart(proj_data).mark_line(
+        strokeDash=[6, 4],
+        color="#E74C3C" if (not chart_data.empty and chart_data["projected_spend"].iloc[-1] > monthly_budget and monthly_budget > 0) else "#3498DB",
+        size=2.5
+    ).encode(
+        x="day:Q",
+        y="projected_spend:Q",
+        tooltip=[alt.Tooltip("day:Q", title="Day"), alt.Tooltip("projected_spend:Q", title="Projected Spend (₹)", format=",.2f")]
+    )
+
+    # 4. Budget ceiling horizontal rule
+    budget_rule = alt.Chart(pd.DataFrame({"budget": [monthly_budget]})).mark_rule(
+        color="#E67E22",
+        size=2,
+        strokeDash=[8, 6]
+    ).encode(
+        y="budget:Q",
+        tooltip=[alt.Tooltip("budget:Q", title="Monthly Limit (₹)", format=",.2f")]
+    )
+
+    return (ideal_line + proj_line + actual_line + actual_points + budget_rule).properties(
+        title="Exponential Velocity Trajectory vs. Monthly Budget Pace",
+        height=380
+    ).interactive()

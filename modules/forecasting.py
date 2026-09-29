@@ -1,363 +1,310 @@
-"""Forecasting helpers for the CashCanvas spending velocity radar."""
-
-from __future__ import annotations
-
-import numpy as np
 import pandas as pd
+import numpy as np
 
 
-def _empty_category_trend_frame() -> pd.DataFrame:
-    """Return the empty result shape for category trend summaries."""
+def calculate_ewma_burn_rate(df: pd.DataFrame, days_in_month: int = 30, span: int = 7) -> float:
+    """Calculates recent daily burn rate using Exponentially Weighted Moving Average (EWMA)."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return 0.0
 
-    return pd.DataFrame(
-        columns=["category", "latest_ewma", "pct_change", "trend_label", "trend_arrow"]
-    )
+    df_clean = df.copy()
+    df_clean.columns = [str(c).strip().lower() for c in df_clean.columns]
+
+    if "amount" not in df_clean.columns:
+        return 0.0
+
+    date_col = "txn_date" if "txn_date" in df_clean.columns else ("date" if "date" in df_clean.columns else None)
+
+    if date_col:
+        df_clean["parsed_date"] = pd.to_datetime(df_clean[date_col], errors="coerce")
+        df_clean = df_clean.dropna(subset=["parsed_date", "amount"])
+        if df_clean.empty:
+            return 0.0
+        daily_spend = df_clean.groupby(df_clean["parsed_date"].dt.day)["amount"].sum()
+    else:
+        daily_spend = pd.to_numeric(df_clean["amount"], errors="coerce").dropna()
+
+    if daily_spend.empty:
+        return 0.0
+
+    ewma_series = daily_spend.ewm(span=span, adjust=False).mean()
+    current_burn_rate = float(ewma_series.iloc[-1]) if not ewma_series.empty else 0.0
+    return max(0.0, current_burn_rate)
 
 
-def compute_velocity_radar(
-    df: pd.DataFrame,
-    budget_limit: float,
-    span: int = 5,
-    month_year: str | None = None,
-    user_id: int | None = None,
-    category: str | None = None,
-):
-    """Project month-end spending from the latest daily EWMA burn rate.
-
-    Parameters
-    ----------
-    df:
-        Transaction rows containing at least ``txn_date`` and ``amount``.
-    budget_limit:
-        Monthly budget ceiling copied unchanged to every output row.
-    span:
-        EWMA span used to estimate the recency-weighted burn rate.
-    month_year:
-        Selected month in ``YYYY-MM`` format.
-    user_id, category:
-        Optional safety filters for mixed imported or test data.
-
-    Returns
-    -------
-    tuple[pd.DataFrame, bool]
-        A DataFrame with the per-day projection columns and a boolean flag that
-        indicates whether the month-end forecast exceeds the budget.
+def generate_velocity_forecast(df: pd.DataFrame, monthly_budget: float = 0.0, days_in_month: int = 30) -> pd.DataFrame:
     """
-
-    columns = [
-        "date",
-        "actual_cumulative",
-        "forecast_cumulative",
-        "upper_band",
-        "lower_band",
-        "budget_limit",
-        "daily_spend",
-        "daily_ewma",
-        "future_day_number",
-        "forecast_daily_rate",
-        "daily_standard_deviation",
-        "as_of_date",
-    ]
-
-    if span < 1:
-        raise ValueError("EWMA span must be at least 1.")
-
-    frame = pd.DataFrame() if df is None else df.copy()
-    if not frame.empty:
-        missing = {"txn_date", "amount"}.difference(frame.columns)
-        if missing:
-            missing_text = ", ".join(sorted(missing))
-            raise ValueError(f"Forecast data is missing required columns: {missing_text}")
-
-        frame["txn_date"] = pd.to_datetime(frame["txn_date"], errors="coerce")
-        frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
-        frame = frame.loc[frame["txn_date"].notna() & frame["amount"].notna()].copy()
-        # CashCanvas stores expenses; negative imports must not reduce the total.
-        frame["amount"] = frame["amount"].clip(lower=0.0)
-
-        if user_id is not None:
-            if "user_id" not in frame.columns:
-                raise ValueError("Forecast data needs a user_id column when user_id is provided.")
-            frame = frame.loc[frame["user_id"] == user_id].copy()
-
-        if category is not None:
-            if "category" not in frame.columns:
-                raise ValueError("Forecast data needs a category column when category is provided.")
-            frame = frame.loc[frame["category"] == category].copy()
-
-    if month_year is not None:
-        selected_period = pd.Period(month_year, freq="M")
-    elif not frame.empty:
-        selected_period = frame["txn_date"].min().to_period("M")
-    else:
-        return pd.DataFrame(columns=columns), False
-
-    month_start = selected_period.start_time.normalize()
-    month_end = selected_period.end_time.normalize()
-    today = pd.Timestamp.today().normalize()
-    current_period = today.to_period("M")
-
-    # A future budget month has no historical burn rate yet. Returning an empty
-    # result avoids inventing a forecast before that month begins.
-    if selected_period > current_period:
-        empty_result = pd.DataFrame(columns=columns)
-        empty_result.attrs["future_month"] = True
-        empty_result.attrs["month_year"] = str(selected_period)
-        return empty_result, False
-
-    # Current months stop at today; completed months stop at their real month end.
-    as_of_date = today if selected_period == current_period else month_end
-    as_of_date = min(as_of_date, month_end)
-
-    calendar_days = pd.date_range(month_start, month_end, freq="D")
-    historical_days = pd.date_range(month_start, as_of_date, freq="D")
-
-    if frame.empty:
-        daily_spend = pd.Series(0.0, index=historical_days, dtype=float)
-    else:
-        frame["calendar_date"] = frame["txn_date"].dt.normalize()
-        month_mask = frame["txn_date"].dt.to_period("M") == selected_period
-        historical_mask = frame["calendar_date"] <= as_of_date
-        selected_rows = frame.loc[month_mask & historical_mask].copy()
-
-        if selected_rows.empty:
-            daily_spend = pd.Series(0.0, index=historical_days, dtype=float)
-        else:
-            daily_spend = (
-                selected_rows.groupby("calendar_date")["amount"].sum().sort_index()
-            )
-            daily_spend = daily_spend.reindex(historical_days, fill_value=0.0)
-
-    # Missing historical dates are real zero-spend days and therefore take part
-    # in the EWMA. Future dates are deliberately not added to this series.
-    daily_ewma = daily_spend.ewm(span=span, adjust=False).mean()
-    valid_ewma = daily_ewma.dropna()
-    latest_ewma_rate = float(valid_ewma.iloc[-1]) if not valid_ewma.empty else 0.0
-    latest_ewma_rate = max(latest_ewma_rate, 0.0)
-
-    actual_history = daily_spend.cumsum().cummax().clip(lower=0.0)
-    current_cumulative = float(actual_history.iloc[-1]) if not actual_history.empty else 0.0
-
-    daily_standard_deviation = float(daily_spend.std(ddof=0)) if not daily_spend.empty else 0.0
-    if not np.isfinite(daily_standard_deviation):
-        daily_standard_deviation = 0.0
-
-    actual_cumulative = pd.Series(np.nan, index=calendar_days, dtype=float)
-    actual_cumulative.loc[historical_days] = actual_history.values
-
-    daily_spend_output = pd.Series(np.nan, index=calendar_days, dtype=float)
-    daily_spend_output.loc[historical_days] = daily_spend.values
-    daily_ewma_output = pd.Series(np.nan, index=calendar_days, dtype=float)
-    daily_ewma_output.loc[historical_days] = daily_ewma.values
-
-    forecast_cumulative = pd.Series(np.nan, index=calendar_days, dtype=float)
-    upper_band = pd.Series(np.nan, index=calendar_days, dtype=float)
-    lower_band = pd.Series(np.nan, index=calendar_days, dtype=float)
-    future_day_number = pd.Series(np.nan, index=calendar_days, dtype=float)
-    forecast_daily_rate = pd.Series(np.nan, index=calendar_days, dtype=float)
-
-    forecast_days = pd.date_range(as_of_date, month_end, freq="D")
-    day_numbers = np.arange(len(forecast_days), dtype=float)
-
-    # Day zero is the as-of date. Every future point extends from the same
-    # current cumulative anchor, which makes the path monotonic and explainable.
-    projected_values = current_cumulative + (latest_ewma_rate * day_numbers)
-    projected_values = np.maximum.accumulate(np.maximum(projected_values, current_cumulative))
-    uncertainty = daily_standard_deviation * np.sqrt(day_numbers)
-    upper_values = np.maximum(projected_values + uncertainty, projected_values)
-    lower_values = np.maximum(projected_values - uncertainty, current_cumulative)
-    lower_values = np.maximum(lower_values, 0.0)
-    lower_values = np.minimum(lower_values, projected_values)
-
-    forecast_cumulative.loc[forecast_days] = projected_values
-    upper_band.loc[forecast_days] = upper_values
-    lower_band.loc[forecast_days] = lower_values
-    future_day_number.loc[forecast_days] = day_numbers
-    forecast_daily_rate.loc[forecast_days] = latest_ewma_rate
-
-    normalized_budget = max(float(budget_limit), 0.0)
-
-    result = pd.DataFrame(
-        {
-            "date": calendar_days,
-            "actual_cumulative": actual_cumulative.values,
-            "forecast_cumulative": forecast_cumulative.values,
-            "upper_band": upper_band.values,
-            "lower_band": lower_band.values,
-            "budget_limit": normalized_budget,
-            "daily_spend": daily_spend_output.values,
-            "daily_ewma": daily_ewma_output.values,
-            "future_day_number": future_day_number.values,
-            "forecast_daily_rate": forecast_daily_rate.values,
-            "daily_standard_deviation": daily_standard_deviation,
-            "as_of_date": as_of_date,
-        }
-    )
-
-    forecast_at_month_end = float(result["forecast_cumulative"].dropna().iloc[-1])
-    remaining_days = int((month_end - as_of_date).days)
-    result.attrs.update(
-        {
-            "month_year": str(selected_period),
-            "month_start": month_start,
-            "month_end": month_end,
-            "as_of_date": as_of_date,
-            "remaining_days": remaining_days,
-            "latest_ewma_rate": latest_ewma_rate,
-            "base_latest_ewma_rate": latest_ewma_rate,
-            "current_cumulative": current_cumulative,
-            "daily_standard_deviation": daily_standard_deviation,
-            "forecast_at_month_end": forecast_at_month_end,
-            "budget_limit": normalized_budget,
-        }
-    )
-
-    will_overspend = bool(forecast_at_month_end > normalized_budget)
-
-    return result, will_overspend
-
-
-def compute_category_trends(df: pd.DataFrame, span: int = 5, lookback_days: int = 14):
-    """Summarize recent spending trends for each category.
-
-    The function looks back over a fixed day window, fills missing days with zero
-    spend, smooths each category with EWMA, and then compares the recent half of
-    the window against the earlier half.
+    Generates a day-by-day projected trajectory.
+    Guarantees valid Timestamp objects so .normalize() never encounters NaT,
+    even when a category has 0 transactions (e.g. Travel).
     """
+    if days_in_month <= 0:
+        days_in_month = 30
 
-    if df is None or df.empty:
-        return _empty_category_trend_frame()
+    monthly_budget = float(monthly_budget) if monthly_budget else 0.0
+    daily_budget_pace = (monthly_budget / days_in_month) if days_in_month > 0 else 0.0
 
-    frame = df.copy()
-    frame["txn_date"] = pd.to_datetime(frame["txn_date"])
+    # Determine reference year and month
+    ref_year, ref_month = None, None
+    df_clean = pd.DataFrame()
 
-    today = pd.Timestamp.today().normalize()
-    end_date = today
-    start_date = end_date - pd.Timedelta(days=lookback_days - 1)
-    date_index = pd.date_range(start_date, end_date, freq="D")
+    if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+        df_clean = df.copy()
+        df_clean.columns = [str(c).strip().lower() for c in df_clean.columns]
+        date_col = "txn_date" if "txn_date" in df_clean.columns else ("date" if "date" in df_clean.columns else None)
 
-    results = []
-    half_window = max(1, lookback_days // 2)
+        if date_col and "amount" in df_clean.columns:
+            df_clean["parsed_date"] = pd.to_datetime(df_clean[date_col], errors="coerce")
+            valid_dates = df_clean["parsed_date"].dropna()
+            if not valid_dates.empty:
+                ref_year = int(valid_dates.iloc[-1].year)
+                ref_month = int(valid_dates.iloc[-1].month)
 
-    # Work one category at a time so the trend label reflects that category's own burn pattern.
-    for category, category_frame in frame.groupby("category"):
-        # Roll the category's transactions into a daily series and fill missing days with zero.
-        daily_series = (
-            category_frame.groupby(category_frame["txn_date"].dt.normalize())["amount"]
-            .sum()
-            .reindex(date_index, fill_value=0.0)
-            .sort_index()
-        )
+    now = pd.Timestamp.now()
+    if ref_year is None or ref_month is None:
+        ref_year, ref_month = now.year, now.month
 
-        if daily_series.empty:
-            continue
+    # Determine last active day for actuals
+    daily_totals = pd.Series(0.0, index=range(1, days_in_month + 1))
+    has_real_txns = False
 
-        # EWMA gives more weight to the most recent days, which makes it useful for spotting momentum.
-        ewma_series = daily_series.ewm(span=span, adjust=False).mean()
+    if not df_clean.empty and "parsed_date" in df_clean.columns and "amount" in df_clean.columns:
+        df_clean["amount"] = pd.to_numeric(df_clean["amount"], errors="coerce").fillna(0.0)
+        df_clean["day"] = df_clean["parsed_date"].dt.day
+        recorded = df_clean.groupby("day")["amount"].sum()
+        for d, amt in recorded.items():
+            if 1 <= d <= days_in_month:
+                daily_totals[d] = amt
+                has_real_txns = True
 
-        recent_half = ewma_series.iloc[-half_window:]
-        earlier_half = ewma_series.iloc[: len(ewma_series) - len(recent_half)]
-
-        latest_ewma = float(ewma_series.iloc[-1])
-        recent_mean = float(recent_half.mean()) if not recent_half.empty else 0.0
-        earlier_mean = float(earlier_half.mean()) if not earlier_half.empty else 0.0
-
-        # Percentage change compares the recent average momentum against the earlier average momentum.
-        if earlier_mean == 0:
-            pct_change = 0.0 if recent_mean == 0 else 100.0
-        else:
-            pct_change = ((recent_mean - earlier_mean) / abs(earlier_mean)) * 100.0
-
-        # Convert the percentage change into a label that is easy to explain in the UI.
-        if pct_change > 25:
-            trend_label = "Rapid increase"
-            trend_arrow = "↑↑"
-        elif pct_change > 5:
-            trend_label = "Increasing"
-            trend_arrow = "↑"
-        elif pct_change < -5:
-            trend_label = "Decreasing"
-            trend_arrow = "↓"
-        else:
-            trend_label = "Stable"
-            trend_arrow = "→"
-
-        results.append(
-            {
-                "category": category,
-                "latest_ewma": latest_ewma,
-                "pct_change": pct_change,
-                "trend_label": trend_label,
-                "trend_arrow": trend_arrow,
-            }
-        )
-
-    if not results:
-        return _empty_category_trend_frame()
-
-    return (
-        pd.DataFrame(results)
-        .sort_values("pct_change", ascending=False)
-        .reset_index(drop=True)
-    )
-
-
-def generate_trend_insight(df: pd.DataFrame, window: int = 10, threshold_pct: int = 15):
-    """Generate a short natural-language insight about overall spending momentum.
-
-    The function compares the EWMA-smoothed spending average in the most recent
-    window against the EWMA-smoothed average in the previous window.
-    """
-
-    if df is None or df.empty:
-        message = "Your spending has been steady over the recent period."
-        return message, 0.0, "stable"
-
-    frame = df.copy()
-    frame["txn_date"] = pd.to_datetime(frame["txn_date"])
-
-    today = pd.Timestamp.today().normalize()
-    end_date = today
-    start_date = end_date - pd.Timedelta(days=(window * 2) - 1)
-    date_index = pd.date_range(start_date, end_date, freq="D")
-
-    # Collapse all categories into one daily total so the insight reflects whole-account spending.
-    daily_spend = (
-        frame.groupby(frame["txn_date"].dt.normalize())["amount"]
-        .sum()
-        .reindex(date_index, fill_value=0.0)
-        .sort_index()
-    )
-
-    # EWMA emphasizes recent days more heavily than older days, which makes the trend responsive.
-    ewma_series = daily_spend.ewm(span=window, adjust=False).mean()
-
-    recent_window = ewma_series.iloc[-window:]
-    previous_window = ewma_series.iloc[:-window]
-
-    recent_mean = float(recent_window.mean()) if not recent_window.empty else 0.0
-    previous_mean = float(previous_window.mean()) if not previous_window.empty else 0.0
-
-    # Compute the relative change between the two halves of the lookback window.
-    if previous_mean == 0:
-        pct_change = 0.0 if recent_mean == 0 else 100.0
+    if has_real_txns:
+        non_zero_days = daily_totals[daily_totals > 0].index
+        last_active_day = int(non_zero_days.max()) if len(non_zero_days) > 0 else 1
     else:
-        pct_change = ((recent_mean - previous_mean) / abs(previous_mean)) * 100.0
+        # For zero-transaction categories, anchor to current day of month or day 1
+        if ref_year == now.year and ref_month == now.month:
+            last_active_day = min(int(now.day), days_in_month)
+        else:
+            last_active_day = days_in_month
 
-    if pct_change >= threshold_pct:
-        message = (
-            f"Your spending trend has increased by {pct_change:.0f}% over the last {window} days. "
-            "Consider reducing discretionary expenses to stay within your monthly budget."
-        )
-        trend_direction = "up"
-    elif pct_change <= -threshold_pct:
-        message = (
-            f"Good progress: your spending trend has decreased by {abs(pct_change):.0f}% over the last "
-            f"{window} days."
-        )
-        trend_direction = "down"
+    cumulative_actual = daily_totals.cumsum()
+    current_spent = float(cumulative_actual.loc[last_active_day])
+    burn_rate = calculate_ewma_burn_rate(df_clean, days_in_month)
+
+    forecast_records = []
+    for day in range(1, days_in_month + 1):
+        try:
+            row_date = pd.Timestamp(year=ref_year, month=ref_month, day=day)
+        except ValueError:
+            row_date = pd.Timestamp(year=ref_year, month=ref_month, day=1) + pd.Timedelta(days=day - 1)
+
+        budget_line = daily_budget_pace * day
+
+        if day <= last_active_day:
+            actual_val = float(cumulative_actual.loc[day])
+            projected_val = actual_val
+            lower_b = actual_val
+            upper_b = actual_val
+        else:
+            remaining_days = day - last_active_day
+            actual_val = np.nan
+            projected_val = current_spent + (burn_rate * remaining_days)
+            margin = burn_rate * 0.15 * (remaining_days ** 0.5)
+            lower_b = max(0.0, projected_val - margin)
+            upper_b = projected_val + margin
+
+        forecast_records.append({
+            "date": row_date,
+            "day": day,
+            "actual_spend": actual_val,
+            "projected_spend": projected_val,
+            "actual_cumulative": actual_val,
+            "forecast_cumulative": projected_val,
+            "lower_band": round(lower_b, 2),
+            "upper_band": round(upper_b, 2),
+            "budget_limit": monthly_budget,
+            "ideal_pace": budget_line,
+        })
+
+    res_df = pd.DataFrame(forecast_records)
+    res_df["date"] = pd.to_datetime(res_df["date"])
+    return res_df
+
+
+def compute_velocity_radar(df: pd.DataFrame = None, *args, **kwargs):
+    """Computes velocity trajectory and summary dictionary compatible with what-if callers."""
+    data = df if df is not None else kwargs.get("filtered_transactions", kwargs.get("transactions", pd.DataFrame()))
+    if data is None or not isinstance(data, pd.DataFrame):
+        data = pd.DataFrame()
+
+    budget = kwargs.get("budget_limit", kwargs.get("monthly_budget", kwargs.get("budget", 0.0)))
+    if not budget and len(args) > 0 and isinstance(args[0], (int, float)):
+        budget = args[0]
+    elif not budget and len(args) > 1 and isinstance(args[1], (int, float)):
+        budget = args[1]
+    budget = float(budget) if budget else 0.0
+
+    days_in_month = kwargs.get("days_in_month", 30)
+    category = kwargs.get("category", None)
+
+    if not data.empty and category and str(category).strip().lower() != "all":
+        col_to_check = None
+        for c in data.columns:
+            if str(c).lower() == "category":
+                col_to_check = c
+                break
+        if col_to_check:
+            data = data[data[col_to_check].astype(str).str.strip().str.lower() == str(category).strip().lower()]
+
+    radar_df = generate_velocity_forecast(data, budget, days_in_month)
+    burn_rate = calculate_ewma_burn_rate(data, days_in_month)
+    projected_spend = float(radar_df["projected_spend"].iloc[-1]) if not radar_df.empty else 0.0
+
+    amt_col = None
+    for c in data.columns:
+        if str(c).lower() == "amount":
+            amt_col = c
+            break
+    total_spent = float(pd.to_numeric(data[amt_col], errors="coerce").sum()) if amt_col else 0.0
+
+    summary_info = {
+        "burn_rate": burn_rate,
+        "budget_limit": budget,
+        "projected_spend": projected_spend,
+        "total_spent": total_spent,
+        "status": "Exceeded" if (projected_spend > budget and budget > 0) else "On Track"
+    }
+
+    return radar_df, summary_info
+
+
+def generate_trend_insight(transactions=None, *args, **kwargs):
+    """Analyzes category spending velocity and returns (insight_message, metric_val, trend_direction)."""
+    if transactions is None or not isinstance(transactions, pd.DataFrame) or transactions.empty:
+        return ("No transactions available to generate trend insights.", 0.0, "neutral")
+
+    try:
+        df = transactions.copy()
+        df.columns = [str(c).strip().lower() for c in df.columns]
+
+        amt_col = "amount" if "amount" in df.columns else None
+        cat_col = "category" if "category" in df.columns else None
+
+        if amt_col and cat_col:
+            df[amt_col] = pd.to_numeric(df[amt_col], errors="coerce").fillna(0.0)
+
+            if "type" in df.columns:
+                df = df[df["type"].astype(str).str.lower() != "income"]
+            else:
+                df = df[df[cat_col].astype(str).str.lower() != "income"]
+
+            cat_totals = df.groupby(cat_col)[amt_col].sum().sort_values(ascending=False)
+
+            if not cat_totals.empty and float(cat_totals.iloc[0]) > 0:
+                top_cat = cat_totals.index[0]
+                top_spend = float(cat_totals.iloc[0])
+                total_spent = float(cat_totals.sum())
+                pct = (top_spend / total_spent * 100) if total_spent > 0 else 0.0
+
+                msg = f"Your highest expenditure is **{top_cat}** at ₹{top_spend:,.2f} ({pct:.1f}% of tracked spend)."
+                return (msg, top_spend, "up")
+    except Exception:
+        pass
+
+    return ("Spending trends appear stable across all tracked categories.", 0.0, "stable")
+
+
+def compute_category_trends(df: pd.DataFrame) -> pd.DataFrame:
+    """Computes category trends with 'Percentage Change' and 'Latest EWMA' for the Dashboard table."""
+    empty_df = pd.DataFrame(
+        columns=["Category", "Total Spend", "Total Spent", "Latest EWMA", "Daily Average", "Percentage Change", "Trend", "Direction"]
+    )
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return empty_df
+
+    df_clean = df.copy()
+    df_clean.columns = [str(c).strip().lower() for c in df_clean.columns]
+
+    amt_col = "amount" if "amount" in df_clean.columns else None
+    cat_col = "category" if "category" in df_clean.columns else None
+    date_col = "txn_date" if "txn_date" in df_clean.columns else ("date" if "date" in df_clean.columns else None)
+
+    if not amt_col or not cat_col:
+        return empty_df
+
+    df_clean[amt_col] = pd.to_numeric(df_clean[amt_col], errors="coerce").fillna(0.0)
+
+    if "type" in df_clean.columns:
+        df_clean = df_clean[df_clean["type"].astype(str).str.lower() != "income"]
     else:
-        message = "Your spending has been steady over the recent period."
-        trend_direction = "stable"
+        df_clean = df_clean[df_clean[cat_col].astype(str).str.lower() != "income"]
 
-    return message, pct_change, trend_direction
+    if date_col:
+        df_clean["parsed_date"] = pd.to_datetime(df_clean[date_col], errors="coerce")
+
+    records = []
+    categories = df_clean[cat_col].dropna().unique()
+
+    for cat in categories:
+        cat_df = df_clean[df_clean[cat_col] == cat]
+        total_spend = float(cat_df[amt_col].sum())
+
+        if "parsed_date" in cat_df.columns and not cat_df["parsed_date"].dropna().empty:
+            cat_daily = cat_df.groupby(cat_df["parsed_date"].dt.day)[amt_col].sum()
+            ewma_val = float(cat_daily.ewm(span=7, adjust=False).mean().iloc[-1]) if not cat_daily.empty else 0.0
+        else:
+            ewma_val = total_spend / 30.0
+
+        daily_avg = total_spend / 30.0
+        pct_change = round(((ewma_val - daily_avg) / daily_avg * 100) if daily_avg > 0 else 0.0, 2)
+
+        if ewma_val > daily_avg * 1.05:
+            trend_str = "🔺 Increasing"
+            direction_str = "up"
+        elif ewma_val < daily_avg * 0.95:
+            trend_str = "🟢 Decreasing"
+            direction_str = "down"
+        else:
+            trend_str = "⚪ Stable"
+            direction_str = "stable"
+
+        records.append({
+            "Category": cat,
+            "Total Spend": total_spend,
+            "Total Spent": total_spend,
+            "Latest EWMA": round(ewma_val, 2),
+            "Daily Average": round(daily_avg, 2),
+            "Percentage Change": pct_change,
+            "Trend": trend_str,
+            "Direction": direction_str,
+        })
+
+    trends_df = pd.DataFrame(records)
+    if not trends_df.empty:
+        trends_df = trends_df.sort_values("Total Spend", ascending=False).reset_index(drop=True)
+
+    return trends_df
+
+
+def prepare_forecast_table(df: pd.DataFrame, monthly_budget: float = 0.0, days_in_month: int = 30) -> pd.DataFrame:
+    """Wrapper function returning velocity forecast dataframe."""
+    return generate_velocity_forecast(df, monthly_budget, days_in_month)
+
+
+def calculate_burn_rate(df: pd.DataFrame, days_elapsed: int) -> float:
+    """Calculates linear arithmetic average daily burn rate."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty or days_elapsed <= 0:
+        return 0.0
+    amt_col = "amount" if "amount" in df.columns else None
+    if not amt_col:
+        for c in df.columns:
+            if str(c).lower() == "amount":
+                amt_col = c
+                break
+    total_spent = float(pd.to_numeric(df[amt_col], errors="coerce").sum()) if amt_col else 0.0
+    return total_spent / days_elapsed
+
+
+def forecast_end_of_month(current_spent: float, burn_rate: float, days_remaining: int) -> float:
+    """Projects month-end spend using current spend and burn rate."""
+    return float(current_spent) + (float(burn_rate) * max(0, int(days_remaining)))

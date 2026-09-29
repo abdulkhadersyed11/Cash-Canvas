@@ -1,7 +1,7 @@
 """Main entry point for the CashCanvas Streamlit app."""
 
 from __future__ import annotations
-
+from views.statement_uploader import render_statement_uploader_view
 import re
 from datetime import date
 
@@ -945,17 +945,14 @@ def _render_ai_summary(transactions: pd.DataFrame) -> None:
         st.info(summary_cache[cache_key])
 
 
+from views.statement_uploader import render_statement_uploader_view
+
+
 def _render_authenticated_sidebar() -> str:
-    """Render the authenticated sidebar and return the selected page label."""
-
-    st.sidebar.title("💸 CashCanvas")
-    st.sidebar.write(f"Signed in as {st.session_state.get('username', 'User')}")
-
-    # Keep the manual router simple so Streamlit's native pages navigation stays out of the way.
+    """Render the sidebar navigation."""
     selected_page = st.sidebar.radio(
         "Navigation",
-        NAVIGATION_OPTIONS,
-        key="selected_page",
+        ["Dashboard", "Velocity Radar", "Statement Importer", "AI Summary"]
     )
 
     if st.sidebar.button("Logout"):
@@ -966,30 +963,44 @@ def _render_authenticated_sidebar() -> str:
 
 
 def _render_authenticated_app() -> None:
-    """Render the authenticated part of the app."""
-
-    st.title("💸 CashCanvas")
-    st.caption("Track smarter. Spend better.")
-
+    """Render the active page based on sidebar selection."""
     _apply_pending_page()
     selected_page = _render_authenticated_sidebar()
     transactions = _get_user_transactions()
 
-    if selected_page == PAGE_DASHBOARD:
-        _render_dashboard(transactions)
-    elif selected_page == PAGE_ADD_EXPENSE:
-        _add_expense_form()
-    elif selected_page == PAGE_SET_BUDGETS:
-        _render_budget_page(transactions)
-    elif selected_page == PAGE_VELOCITY_RADAR:
-        _render_velocity_radar(transactions)
-    elif selected_page == PAGE_AI_SUMMARY:
-        _render_ai_summary(transactions)
+    if selected_page == "Dashboard":
+        # Look for your dashboard function defined higher up in app.py
+        if "_render_dashboard" in globals():
+            _render_dashboard(transactions)
+        elif "render_dashboard_view" in globals():
+            render_dashboard_view(transactions)
+        elif "_render_dashboard_page" in globals():
+            _render_dashboard_page(transactions)
+
+    elif selected_page == "Velocity Radar":
+        # Look for your velocity radar function defined higher up in app.py
+        if "_render_velocity_radar" in globals():
+            _render_velocity_radar(transactions)
+        elif "render_velocity_radar_view" in globals():
+            render_velocity_radar_view(transactions)
+        elif "_render_velocity_radar_page" in globals():
+            _render_velocity_radar_page(transactions)
+
+    elif selected_page == "Statement Importer":
+        render_statement_uploader_view(st.session_state["user_id"], transactions)
+
+    elif selected_page == "AI Summary":
+        # Look for your AI summary function defined higher up in app.py
+        if "_render_ai_summary" in globals():
+            _render_ai_summary(transactions)
+        elif "render_ai_summary_view" in globals():
+            render_ai_summary_view(transactions)
+        elif "_render_ai_summary_page" in globals():
+            _render_ai_summary_page(transactions)
 
 
 def main() -> None:
-    """Render the full CashCanvas app."""
-
+    """App entrypoint."""
     st.set_page_config(
         page_title="CashCanvas",
         page_icon="💰",
@@ -1002,6 +1013,7 @@ def main() -> None:
 
     if not st.session_state.get("logged_in"):
         _render_login_gate()
+        return
 
     _render_authenticated_app()
 
