@@ -75,8 +75,8 @@ def prepare_forecast_table(
     table["Variance"] = proj_val - budget_val
     table["Difference"] = table["Variance"]
 
+    table.attrs = {}
     return table
-
 
 def render_velocity_radar_view(user_id: int, all_user_transactions: pd.DataFrame):
     """Renders the standalone Velocity Radar view."""
@@ -128,4 +128,4 @@ def render_velocity_radar_view(user_id: int, all_user_transactions: pd.DataFrame
     m3.metric("Projected Month-End Spend", f"₹{forecast_df['projected_spend'].iloc[-1]:,.2f}")
 
     radar_chart = build_velocity_radar_chart(forecast_df, monthly_budget)
-    st.altair_chart(radar_chart, use_container_width=True)
+    st.altair_chart(radar_chart, width="stretch")

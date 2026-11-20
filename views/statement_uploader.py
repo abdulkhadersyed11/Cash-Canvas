@@ -22,7 +22,7 @@ def render_statement_uploader_view(user_id: int, all_user_transactions: pd.DataF
             st.success(f"Parsed {len(parsed_df)} transactions from statement.")
 
             with st.expander("🔍 Preview Categorized Transactions", expanded=False):
-                st.dataframe(parsed_df.head(15), use_container_width=True)
+                st.dataframe(parsed_df.head(15), width="stretch")
 
             if st.button("💾 Save All Transactions to Database", type="primary"):
                 count = bulk_insert_transactions(user_id, parsed_df)
@@ -110,6 +110,6 @@ def render_statement_uploader_view(user_id: int, all_user_transactions: pd.DataF
     ]
     if active_summary:
         with st.expander(f"📋 View Active Limits for {selected_year} ({len(active_summary)} configured)", expanded=True):
-            st.dataframe(pd.DataFrame(active_summary), use_container_width=True)
+            st.dataframe(pd.DataFrame(active_summary), width="stretch")
     else:
         st.info(f"No categories have active limits set for {selected_year} yet. Enter targets above and click Save.")

@@ -46,12 +46,14 @@ PAGE_DASHBOARD = "📊 Dashboard"
 PAGE_ADD_EXPENSE = "➕ Add Expense"
 PAGE_SET_BUDGETS = "💰 Set Budgets"
 PAGE_VELOCITY_RADAR = "🚦 Velocity Radar"
+PAGE_STATEMENT_IMPORTER = "📥 Statement Importer"
 PAGE_AI_SUMMARY = "✨ AI Monthly Summary"
 NAVIGATION_OPTIONS = [
     PAGE_DASHBOARD,
     PAGE_ADD_EXPENSE,
     PAGE_SET_BUDGETS,
     PAGE_VELOCITY_RADAR,
+    PAGE_STATEMENT_IMPORTER,
     PAGE_AI_SUMMARY,
 ]
 
@@ -339,8 +341,8 @@ def _apply_pending_page() -> None:
     if "pending_page" in st.session_state:
         st.session_state["selected_page"] = st.session_state.pop("pending_page")
 
-    st.session_state.setdefault("selected_page", PAGE_DASHBOARD)
-
+    if st.session_state.get("selected_page") not in NAVIGATION_OPTIONS:
+        st.session_state["selected_page"] = PAGE_DASHBOARD
 
 def _clear_authenticated_state() -> None:
     """Clear every session key so the next run returns to the login page."""
@@ -418,12 +420,12 @@ def _add_expense_form() -> None:
             return
 
         add_transaction(
-            user_id=user_id,
-            amount=float(amount),
-            category=canonicalize_category(category),
-            description=description.strip(),
-            txn_date=selected_date.isoformat(),
-        )
+         user_id=user_id,
+         date=selected_date.isoformat(),
+         description=description.strip(),
+         amount=float(amount),
+         category=canonicalize_category(category),
+     )
         st.session_state["flash_success"] = "Expense added successfully!"
         st.session_state["pending_page"] = PAGE_DASHBOARD
         st.rerun()
@@ -634,7 +636,7 @@ def _render_dashboard(transactions: pd.DataFrame) -> None:
     with st.container(border=True):
         st.subheader("Recent Expenses")
         recent_expenses = _prepare_recent_expenses_table(transactions)
-        st.dataframe(recent_expenses, use_container_width=True, hide_index=True)
+        st.dataframe(recent_expenses, width="stretch", hide_index=True)
 
     chart_options = [
         "Category Spending Breakdown",
@@ -683,10 +685,10 @@ def _render_dashboard(transactions: pd.DataFrame) -> None:
         if chart_validation_error:
             st.warning(chart_validation_error)
         else:
-            st.altair_chart(chart, use_container_width=True)
+            st.altair_chart(chart, width="stretch")
         if selected_chart == "Daily Expenses vs EWMA Trend":
             st.caption("EWMA smooths day-to-day spending fluctuations by giving more weight to recent expenses.")
-        st.dataframe(chart_table, use_container_width=True, hide_index=True)
+        st.dataframe(chart_table, width="stretch", hide_index=True)
 
     trends = compute_category_trends(transactions)
     if trends.empty:
@@ -695,7 +697,7 @@ def _render_dashboard(transactions: pd.DataFrame) -> None:
 
     with st.container(border=True):
         st.subheader("Category Trends")
-        st.dataframe(_prepare_category_trends_table(trends), use_container_width=True, hide_index=True)
+        st.dataframe(_prepare_category_trends_table(trends), width="stretch", hide_index=True)
 
 
 def _render_velocity_radar(transactions: pd.DataFrame) -> None:
@@ -839,7 +841,7 @@ def _render_velocity_radar(transactions: pd.DataFrame) -> None:
         )
 
     forecast_chart = create_velocity_radar_chart(adjusted_radar_df, selected_budget)
-    st.altair_chart(forecast_chart, use_container_width=True)
+    st.altair_chart(forecast_chart, width="stretch")
 
     focus_columns = [
         "actual_cumulative",
@@ -866,7 +868,7 @@ def _render_velocity_radar(transactions: pd.DataFrame) -> None:
         forecast_spend=forecast_end,
         budget_limit=selected_budget,
     )
-    st.altair_chart(budget_chart, use_container_width=True)
+    st.altair_chart(budget_chart, width="stretch")
 
     with st.expander("🔍 Forecast calculation details"):
         details = pd.DataFrame(
@@ -889,14 +891,14 @@ def _render_velocity_radar(transactions: pd.DataFrame) -> None:
                 ],
             }
         )
-        st.dataframe(details, use_container_width=True, hide_index=True)
+        st.dataframe(details, width="stretch", hide_index=True)
 
     forecast_table = prepare_forecast_table(adjusted_radar_df)
     for column in ["Actual Spending", "Forecast", "Lower Band", "Upper Band", "Budget Limit"]:
         forecast_table[column] = forecast_table[column].apply(
             lambda value: "—" if pd.isna(value) else _format_currency(float(value))
         )
-    st.dataframe(forecast_table, use_container_width=True, hide_index=True)
+    st.dataframe(forecast_table, width="stretch", hide_index=True)
 
     if selected_category is not None:
         st.caption(f"Showing {selected_category} spending for {_month_label(selected_month)}.")
@@ -945,14 +947,13 @@ def _render_ai_summary(transactions: pd.DataFrame) -> None:
         st.info(summary_cache[cache_key])
 
 
-from views.statement_uploader import render_statement_uploader_view
-
-
 def _render_authenticated_sidebar() -> str:
     """Render the sidebar navigation."""
+    st.sidebar.caption(f"Signed in as **{st.session_state.get('username', '')}**")
     selected_page = st.sidebar.radio(
         "Navigation",
-        ["Dashboard", "Velocity Radar", "Statement Importer", "AI Summary"]
+        NAVIGATION_OPTIONS,
+        key="selected_page",
     )
 
     if st.sidebar.button("Logout"):
@@ -968,35 +969,23 @@ def _render_authenticated_app() -> None:
     selected_page = _render_authenticated_sidebar()
     transactions = _get_user_transactions()
 
-    if selected_page == "Dashboard":
-        # Look for your dashboard function defined higher up in app.py
-        if "_render_dashboard" in globals():
-            _render_dashboard(transactions)
-        elif "render_dashboard_view" in globals():
-            render_dashboard_view(transactions)
-        elif "_render_dashboard_page" in globals():
-            _render_dashboard_page(transactions)
-
-    elif selected_page == "Velocity Radar":
-        # Look for your velocity radar function defined higher up in app.py
-        if "_render_velocity_radar" in globals():
-            _render_velocity_radar(transactions)
-        elif "render_velocity_radar_view" in globals():
-            render_velocity_radar_view(transactions)
-        elif "_render_velocity_radar_page" in globals():
-            _render_velocity_radar_page(transactions)
-
-    elif selected_page == "Statement Importer":
+    if selected_page == PAGE_DASHBOARD:
+        _render_dashboard(transactions)
+    elif selected_page == PAGE_ADD_EXPENSE:
+        _add_expense_form()
+    elif selected_page == PAGE_SET_BUDGETS:
+        _render_budget_page(transactions)
+    elif selected_page == PAGE_VELOCITY_RADAR:
+        _render_velocity_radar(transactions)
+    elif selected_page == PAGE_STATEMENT_IMPORTER:
         render_statement_uploader_view(st.session_state["user_id"], transactions)
+    elif selected_page == PAGE_AI_SUMMARY:
+        _render_ai_summary(transactions)
 
-    elif selected_page == "AI Summary":
-        # Look for your AI summary function defined higher up in app.py
-        if "_render_ai_summary" in globals():
-            _render_ai_summary(transactions)
-        elif "render_ai_summary_view" in globals():
-            render_ai_summary_view(transactions)
-        elif "_render_ai_summary_page" in globals():
-            _render_ai_summary_page(transactions)
+@st.cache_resource
+def _init_db_once() -> None:
+    """Initialize SQLite tables once per server startup."""
+    initialize_database()
 
 
 def main() -> None:
@@ -1008,7 +997,7 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
 
-    initialize_database()
+    _init_db_once()
     ensure_session_defaults()
 
     if not st.session_state.get("logged_in"):
@@ -1020,4 +1009,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    

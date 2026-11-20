@@ -154,7 +154,11 @@ def init_db(db_path: str = "cashcanvas.db") -> None:
                 cursor.execute("ALTER TABLE users ADD COLUMN password_hash TEXT DEFAULT ''")
             except Exception:
                 pass
-
+        if "email" not in user_cols:
+            try:
+                cursor.execute("ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''")
+            except Exception:
+                pass
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS category_budgets (
@@ -269,7 +273,14 @@ def create_tables(db_path: str = "cashcanvas.db") -> None:
 # 1. USER AUTHENTICATION & SESSIONS
 # ==========================================
 
-def create_user(username: str, password: str, *args, db_path: str = "cashcanvas.db", **kwargs) -> bool:
+def create_user(
+    username: str,
+    email_or_password: str,
+    password_hash: str | None = None,
+    *args,
+    db_path: str = "cashcanvas.db",
+    **kwargs,
+) -> int | None:
     init_db(db_path)
     conn = get_db_connection(db_path)
     cursor = conn.cursor()
@@ -277,31 +288,45 @@ def create_user(username: str, password: str, *args, db_path: str = "cashcanvas.
         cursor.execute("PRAGMA table_info(users)")
         cols = {r[1] for r in cursor.fetchall()}
 
+        # Handles both create_user(username, email, password_hash)
+        # and create_user(username, password_hash)
+        if password_hash is not None:
+            email = str(email_or_password).strip()
+            stored_password = str(password_hash).strip()
+        else:
+            email = str(kwargs.get("email", "")).strip()
+            stored_password = str(email_or_password).strip()
+
         fields = ["username"]
         placeholders = ["?"]
         values = [str(username).strip()]
 
+        if "email" in cols:
+            fields.append("email")
+            placeholders.append("?")
+            values.append(email)
+
         if "password" in cols:
             fields.append("password")
             placeholders.append("?")
-            values.append(str(password).strip())
+            values.append(stored_password)
 
         if "password_hash" in cols:
             fields.append("password_hash")
             placeholders.append("?")
-            values.append(str(password).strip())
+            values.append(stored_password)
 
         cursor.execute(
             f"INSERT INTO users ({', '.join(fields)}) VALUES ({', '.join(placeholders)})",
-            tuple(values)
+            tuple(values),
         )
         conn.commit()
         st.cache_data.clear()
-        return True
+        return cursor.lastrowid
     except sqlite3.IntegrityError:
-        return False
+        return None
     except Exception:
-        return False
+        return None
     finally:
         conn.close()
 
